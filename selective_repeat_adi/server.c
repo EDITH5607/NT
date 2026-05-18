@@ -1,32 +1,33 @@
 #include <arpa/inet.h>
-#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #define PORT 54362
 #define MAXFRAMES 10
-#define BUFFER_SIZE 1024
+#define WINDOWSIZE 4
 
 typedef struct {
-  int seq;
-  int ack;
   int type;  // 1=ACK, 0=NACK
-  char data[BUFFER_SIZE];
+  int ack;
+  int seq;
+  char data[1024];
 } Frame;
 
 int main() {
-  int sockfd;
+  int sock;
   struct sockaddr_in server_addr, client_addr;
-  socklen_t addr_len = sizeof(client_addr);
+  socklen_t client_len = sizeof(client_addr);
 
-  Frame received_frames[MAXFRAMES];
-  int expected_seq = 0;
+  Frame frame, response;
+  int received[MAXFRAMES] = {0};
+  int base = 0;
 
   // Create UDP socket
-  sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-  if (sockfd < 0) {
+  sock = socket(AF_INET, SOCK_DGRAM, 0);
+  if (sock < 0) {
     printf("Server socket creation failed\n");
     exit(1);
   }
@@ -38,66 +39,89 @@ int main() {
   server_addr.sin_addr.s_addr = INADDR_ANY;
 
   // Bind socket
-  if (bind(sockfd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-    printf("Bind failed\n");
+  if (bind(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+    printf("Binding failed\n");
+    close(sock);
     exit(1);
   }
 
-  printf("[SERVER] Selective Repeat Server started on port %d\n", PORT);
-  printf("[SERVER] Waiting for frames...\n\n");
+  printf("========================================\n");
+  printf("SELECTIVE REPEAT SERVER STARTED\n");
+  printf("Port: %d | Max Frames: %d | Window Size: %d\n", PORT, MAXFRAMES,
+         WINDOWSIZE);
+  printf("========================================\n\n");
 
-  // Initialize received frames buffer
-  for (int i = 0; i < MAXFRAMES; i++) {
-    received_frames[i].seq = -1;
-  }
+  srand(time(NULL));
 
-  while (expected_seq < MAXFRAMES) {
-    Frame frame;
-    int n = recvfrom(sockfd, &frame, sizeof(frame), 0,
-                     (struct sockaddr*)&client_addr, &addr_len);
+  while (base < MAXFRAMES) {
+    // Receive frame from client
+    int n = recvfrom(sock, &frame, sizeof(frame), 0,
+                     (struct sockaddr*)&client_addr, &client_len);
 
-    if (n > 0) {
-      printf("[SERVER] Received Frame %d\n", frame.seq);
+    if (n <= 0) {
+      continue;
+    }
 
-      // Check if this is the expected frame
-      if (frame.seq == expected_seq) {
-        // Expected frame received
-        received_frames[frame.seq] = frame;
-        frame.type = 1;  // ACK
-        frame.ack = frame.seq;
-        sendto(sockfd, &frame, sizeof(frame), 0, (struct sockaddr*)&client_addr,
-               addr_len);
-        printf("[SERVER] Sent ACK %d\n", frame.seq);
+    // Simulate packet loss (30% chance)
+    if (rand() % 10 < 3) {
+      printf("[LOSS]  Frame %d DROPPED (simulated loss)\n", frame.seq);
+      continue;
+    }
 
-        expected_seq++;
+    printf("[RECV] Received Frame %d\n", frame.seq);
 
-        // Check if any buffered frames can be delivered
-        while (expected_seq < MAXFRAMES &&
-               received_frames[expected_seq].seq != -1) {
-          printf("[SERVER] Delivered buffered Frame %d\n", expected_seq);
-          expected_seq++;
-        }
-      } else if (frame.seq > expected_seq) {
-        // Out-of-order frame - buffer it
-        received_frames[frame.seq] = frame;
-        frame.type = 1;  // Still send ACK
-        frame.ack = frame.seq;
-        sendto(sockfd, &frame, sizeof(frame), 0, (struct sockaddr*)&client_addr,
-               addr_len);
-        printf("[SERVER] Out-of-order Frame %d - Buffered, Sent ACK %d\n",
-               frame.seq, frame.seq);
-      } else {
-        // Duplicate frame - resend ACK
-        frame.type = 1;
-        frame.ack = frame.seq;
-        sendto(sockfd, &frame, sizeof(frame), 0, (struct sockaddr*)&client_addr,
-               addr_len);
-        printf("[SERVER] Duplicate Frame %d - Resent ACK\n", frame.seq);
+    // Check if frame sequence number is within receive window
+    if (frame.seq >= base && frame.seq < base + WINDOWSIZE) {
+      // Accept the frame
+      if (!received[frame.seq]) {
+        received[frame.seq] = 1;
+        printf("[BUFFER] Frame %d stored in buffer\n", frame.seq);
+      }
+
+      // Send ACK for this frame (Selective Repeat ACKs every frame)
+      response.type = 1;  // ACK
+      response.ack = frame.seq;
+
+      sendto(sock, &response, sizeof(response), 0,
+             (struct sockaddr*)&client_addr, client_len);
+      printf("[ACK]  Sent ACK %d\n", frame.seq);
+
+      // Try to deliver consecutive frames starting from base
+      while (base < MAXFRAMES && received[base]) {
+        printf("[DELIVER]  Delivered Frame %d to application\n", base);
+        base++;
+      }
+
+      printf("[WINDOW] Current receive window base: %d\n\n", base);
+    } else if (frame.seq < base) {
+      // Duplicate frame - resend ACK
+      response.type = 1;  // ACK
+      response.ack = frame.seq;
+
+      sendto(sock, &response, sizeof(response), 0,
+             (struct sockaddr*)&client_addr, client_len);
+      printf("[DUP]  Duplicate Frame %d, ACK resent\n\n", frame.seq);
+    } else if (frame.seq >= base + WINDOWSIZE) {
+      // Frame outside window - ignore (send NACK for missing frames?)
+      printf("[OUT]  Frame %d outside window [%d-%d], ignoring\n\n", frame.seq,
+             base, base + WINDOWSIZE - 1);
+
+      // Optional: Send NACK for base frame to help sender
+      if (!received[base]) {
+        response.type = 0;  // NACK
+        response.ack = base;
+
+        sendto(sock, &response, sizeof(response), 0,
+               (struct sockaddr*)&client_addr, client_len);
+        printf("[NACK]  Sent NACK for missing Frame %d\n\n", base);
       }
     }
   }
 
-  printf("\n[SERVER] All frames received successfully!\n");
-  close(sockfd);
+  printf("\n========================================\n");
+  printf(" ALL FRAMES RECEIVED SUCCESSFULLY!\n");
+  printf("========================================\n");
+
+  close(sock);
   return 0;
 }

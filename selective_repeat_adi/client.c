@@ -3,105 +3,100 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
-#define PORT 54362
 #define MAXFRAMES 10
-#define WINDOW_SIZE 4
+#define WINDOWSIZE 4
+#define PORT 54362
 #define TIMEOUT_SEC 2
-#define BUFFER_SIZE 1024
 
 typedef struct {
-  int seq;
-  int ack;
   int type;  // 1=ACK, 0=NACK
-  char data[BUFFER_SIZE];
+  int ack;
+  int seq;
+  char data[1024];
 } Frame;
 
+// Timer structure for each frame
 typedef struct {
   int seq;
   int acked;
-  int timer_started;
   struct timeval send_time;
-} TimerInfo;
+  int timer_started;
+} FrameTimer;
 
 int main() {
-  int sockfd;
+  int sock, next = 0, base = 0;
   struct sockaddr_in server_addr;
-  socklen_t addr_len = sizeof(server_addr);
+  socklen_t server_len;
+  Frame frame;
 
-  Frame frames[MAXFRAMES];
-  TimerInfo timers[MAXFRAMES];
-  int base = 0;
-  int next_seq = 0;
-  int ack_count = 0;
+  FrameTimer timers[MAXFRAMES];
+  int acked[MAXFRAMES] = {0};
 
-  // Create UDP socket
-  sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-  if (sockfd < 0) {
+  struct timeval tv = {TIMEOUT_SEC, 0};
+
+  // Create socket
+  sock = socket(AF_INET, SOCK_DGRAM, 0);
+  if (sock < 0) {
     printf("Client socket creation failed\n");
     exit(1);
   }
 
   // Setup server address
   memset(&server_addr, 0, sizeof(server_addr));
+  server_len = sizeof(server_addr);
   server_addr.sin_family = AF_INET;
   server_addr.sin_port = htons(PORT);
   server_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
 
-  // Set socket timeout
-  struct timeval tv;
-  tv.tv_sec = TIMEOUT_SEC;
-  tv.tv_usec = 0;
-  setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  // Set timeout for recvfrom
+  setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-  // Initialize frames with dummy data
+  // Initialize timers
   for (int i = 0; i < MAXFRAMES; i++) {
-    frames[i].seq = i;
-    frames[i].type = 0;
-    sprintf(frames[i].data, "This is frame number %d", i);
-
     timers[i].seq = i;
     timers[i].acked = 0;
     timers[i].timer_started = 0;
   }
 
-  printf("[CLIENT] Selective Repeat Client Started\n");
-  printf("[CLIENT] Total Frames: %d, Window Size: %d\n", MAXFRAMES,
-         WINDOW_SIZE);
-  printf("[CLIENT] Timeout: %d seconds\n\n", TIMEOUT_SEC);
+  printf("[CLIENT] Selective Repeat Started\n");
+  printf("[CLIENT] Total Frames: %d, Window Size: %d\n", MAXFRAMES, WINDOWSIZE);
 
-  while (ack_count < MAXFRAMES) {
-    // Send frames in current window
-    while (next_seq < base + WINDOW_SIZE && next_seq < MAXFRAMES) {
-      if (!timers[next_seq].acked) {
-        // Send frame
-        sendto(sockfd, &frames[next_seq], sizeof(Frame), 0,
-               (struct sockaddr*)&server_addr, addr_len);
-        printf("[CLIENT] Sent Frame %d\n", next_seq);
+  while (base < MAXFRAMES) {
+    // ========== PHASE 1: SEND FRAMES IN WINDOW ==========
+    while (next < base + WINDOWSIZE && next < MAXFRAMES) {
+      if (!timers[next].acked) {
+        frame.seq = next;
+        frame.type = 0;
+        printf("[CLIENT] Sending Frame %d\n", frame.seq);
+        sendto(sock, &frame, sizeof(frame), 0, (struct sockaddr*)&server_addr,
+               server_len);
 
         // Start timer for this frame
-        gettimeofday(&timers[next_seq].send_time, NULL);
-        timers[next_seq].timer_started = 1;
+        gettimeofday(&timers[next].send_time, NULL);
+        timers[next].timer_started = 1;
       }
-      next_seq++;
+      next++;
     }
 
-    // Check for timeouts
+    // ========== PHASE 2: CHECK FOR TIMEOUTS ==========
     struct timeval current_time;
     gettimeofday(&current_time, NULL);
 
-    for (int i = base; i < next_seq; i++) {
+    for (int i = base; i < next; i++) {
       if (!timers[i].acked && timers[i].timer_started) {
         long elapsed =
             (current_time.tv_sec - timers[i].send_time.tv_sec) * 1000 +
             (current_time.tv_usec - timers[i].send_time.tv_usec) / 1000;
 
         if (elapsed >= TIMEOUT_SEC * 1000) {
-          // Timeout - resend ONLY this frame (Selective Repeat!)
-          printf("[CLIENT] TIMEOUT! Resending Frame %d only\n", i);
-          sendto(sockfd, &frames[i], sizeof(Frame), 0,
-                 (struct sockaddr*)&server_addr, addr_len);
+          //  SELECTIVE REPEAT: Resend ONLY this frame
+          printf("[CLIENT]  TIMEOUT! Resending Frame %d only\n", i);
+          frame.seq = i;
+          sendto(sock, &frame, sizeof(frame), 0, (struct sockaddr*)&server_addr,
+                 server_len);
 
           // Restart timer
           gettimeofday(&timers[i].send_time, NULL);
@@ -109,46 +104,47 @@ int main() {
       }
     }
 
-    // Receive ACKs/NACKs
+    // ========== PHASE 3: RECEIVE ACKS/NACKS ==========
     Frame response;
-    int n = recvfrom(sockfd, &response, sizeof(response), 0,
-                     (struct sockaddr*)&server_addr, &addr_len);
+    int r = recvfrom(sock, &response, sizeof(response), 0,
+                     (struct sockaddr*)&server_addr, &server_len);
 
-    if (n > 0) {
-      if (response.type == 1) {  // ACK received
+    if (r > 0) {
+      if (response.type == 1)  // ACK received
+      {
         int ack_num = response.ack;
         if (!timers[ack_num].acked) {
           timers[ack_num].acked = 1;
-          ack_count++;
-          printf("[CLIENT] Received ACK %d (Total ACKs: %d/%d)\n", ack_num,
-                 ack_count, MAXFRAMES);
+          acked[ack_num] = 1;
+          printf("[CLIENT]  ACK %d received\n", ack_num);
 
-          // Slide window
+          // Slide window - move base past all consecutive acked frames
           while (base < MAXFRAMES && timers[base].acked) {
             printf("[CLIENT] Window slid - Base now: %d\n", base + 1);
             base++;
           }
         }
-      } else if (response.type == 0) {  // NACK received
+      } else if (response.type == 0)  // NACK received
+      {
+        // SELECTIVE REPEAT: Resend ONLY the NACKed frame
         int nack_num = response.ack;
-        printf("[CLIENT] Received NACK for Frame %d - Resending immediately\n",
-               nack_num);
+        printf(
+            "[CLIENT]  NACK received for Frame %d - Resending immediately\n",
+            nack_num);
 
-        // Selective Repeat: Resend ONLY the NACKed frame
-        sendto(sockfd, &frames[nack_num], sizeof(Frame), 0,
-               (struct sockaddr*)&server_addr, addr_len);
+        frame.seq = nack_num;
+        sendto(sock, &frame, sizeof(frame), 0, (struct sockaddr*)&server_addr,
+               server_len);
 
         // Restart timer
         gettimeofday(&timers[nack_num].send_time, NULL);
       }
     }
 
-    // Small delay to prevent CPU spinning
-    usleep(10000);
+    usleep(10000);  // Small delay to prevent CPU spinning
   }
 
-  printf("\n[CLIENT] All %d frames sent and acknowledged successfully!\n",
-         MAXFRAMES);
-  close(sockfd);
+  printf("\n[CLIENT] All frames sent successfully!\n");
+  close(sock);
   return 0;
 }
